@@ -116,7 +116,6 @@ def calculate_distribution_similarity(pred_probs, true_actions, action_dim=5):
 CONVERGENCE_EPSILON = 1e-5
 CONVERGENCE_WINDOW = 3
 LE_PERTURBATION_EPSILON = 1e-6
-MACRO_ACTION_SCALE = 0.1
 
 
 def _reset_network_for_metric_replay(network, initial_states):
@@ -294,7 +293,7 @@ def compute_policy_probability_cost(
     policy_probabilities,
     selected_actions,
     selected_log_probs,
-    macro_debunking_action,
+    macro_debunking_log_prob,
 ):
     community_cost = 0.0
     for probabilities, actions, log_probs in zip(
@@ -317,13 +316,12 @@ def compute_policy_probability_cost(
         elif log_probs is not None and log_probs.numel() > 0:
             community_cost += torch.exp(log_probs.detach().float()).sum().item()
 
-    if macro_debunking_action is None:
+    if macro_debunking_log_prob is None:
         network_cost = 0.0
     else:
-        normalized_macro_action = (
-            torch.abs(macro_debunking_action.detach().float()) / MACRO_ACTION_SCALE
-        )
-        network_cost = torch.sigmoid(normalized_macro_action).sum().item()
+        network_cost = torch.exp(
+            macro_debunking_log_prob.detach().float().clamp(-50.0, 0.0)
+        ).sum().item()
 
     return community_cost + network_cost
 
@@ -860,7 +858,8 @@ def train_simulation():
              all_suppress_opp_probs, all_rumor_opp_probs,
              all_suppress_values, all_rumor_values,
              macro_obs_counter, macro_obs_rumor,
-             macro_counter_action, macro_rumor_action) = controller.get_actions(
+             macro_counter_action, macro_rumor_action,
+             macro_counter_log_prob, macro_rumor_log_prob) = controller.get_actions(
                 all_edge_features,
                 H_dyn_graph,
                 Z_t_macro,
@@ -1040,7 +1039,7 @@ def train_simulation():
                     suppress_policy_probabilities,
                     all_suppress_actions,
                     all_suppress_log_probs,
-                    macro_counter_action,
+                    macro_counter_log_prob,
                 )
             )
             episode_action_entropy_history.append(
@@ -1050,6 +1049,15 @@ def train_simulation():
             # 获取新边特征，并保持与当前观测相同的结构增强维度
             network.refresh_representations(detach=True)
             next_edge_features = network.get_edge_features(include_structural=True)
+            _, next_H_dyn_graph, _ = network.get_structure_and_dynamics_representation(detach=True)
+            next_Z_t_macro = network.get_macro_density()
+            next_macro_obs_counter, next_macro_obs_rumor = controller.build_macro_observations(
+                next_H_dyn_graph,
+                next_Z_t_macro,
+                all_suppress_actions,
+                all_rumor_actions,
+                network.fixed_edge_index,
+            )
 
             # 为每个智能体存储经验
             for agent_id in range(NUM_AGENTS):
@@ -1138,8 +1146,28 @@ def train_simulation():
                      subnet_suppress_reward, subnet_next_edge_features, all_suppress_values[agent_id]),
                     (subnet_edge_features, all_rumor_actions[agent_id], all_rumor_log_probs[agent_id],
                      subnet_rumor_reward, subnet_next_edge_features, all_rumor_values[agent_id]),
-                    (suppress_opp_action, rumor_opp_action)  # 同一子网内的对手动作
+                    (suppress_opp_action, rumor_opp_action),  # 同一子网内的对手动作
+                    terminal=(step == STEPS_PER_EPISODE - 1)
                 )
+
+            controller.store_macro_experience(
+                (
+                    macro_obs_counter.detach().clone(),
+                    macro_counter_action.detach().clone(),
+                    macro_counter_log_prob.detach().clone(),
+                    float(suppress_reward),
+                    next_macro_obs_counter.detach().clone(),
+                    float(step == STEPS_PER_EPISODE - 1),
+                ),
+                (
+                    macro_obs_rumor.detach().clone(),
+                    macro_rumor_action.detach().clone(),
+                    macro_rumor_log_prob.detach().clone(),
+                    float(rumor_reward),
+                    next_macro_obs_rumor.detach().clone(),
+                    float(step == STEPS_PER_EPISODE - 1),
+                ),
+            )
 
             # 第一阶段不更新对手模型，只更新Actor
             # 更新智能体策略
@@ -1331,7 +1359,8 @@ def train_simulation():
              all_suppress_opp_probs, all_rumor_opp_probs,
              all_suppress_values, all_rumor_values,
              macro_obs_counter, macro_obs_rumor,
-             macro_counter_action, macro_rumor_action) = controller.get_actions(
+             macro_counter_action, macro_rumor_action,
+             macro_counter_log_prob, macro_rumor_log_prob) = controller.get_actions(
                 all_edge_features,
                 H_dyn_graph,
                 Z_t_macro,
@@ -1437,7 +1466,8 @@ def train_simulation():
                      suppress_reward, subnet_next_edge_features, all_suppress_values[agent_id]),
                     (subnet_edge_features, all_rumor_actions[agent_id], all_rumor_log_probs[agent_id],
                      rumor_reward, subnet_next_edge_features, all_rumor_values[agent_id]),
-                    (suppress_opp_action, rumor_opp_action)
+                    (suppress_opp_action, rumor_opp_action),
+                    terminal=(step == STEPS_PER_EPISODE - 1)
                 )
 
             # 第二阶段：只更新对手模型
@@ -1586,7 +1616,8 @@ def train_simulation():
              all_suppress_opp_probs, all_rumor_opp_probs,
              all_suppress_values, all_rumor_values,
              macro_obs_counter, macro_obs_rumor,
-             macro_counter_action, macro_rumor_action) = controller.get_actions(
+             macro_counter_action, macro_rumor_action,
+             macro_counter_log_prob, macro_rumor_log_prob) = controller.get_actions(
                 all_edge_features,
                 H_dyn_graph,
                 Z_t_macro,
@@ -1742,7 +1773,7 @@ def train_simulation():
                     suppress_policy_probabilities,
                     all_suppress_actions,
                     all_suppress_log_probs,
-                    macro_counter_action,
+                    macro_counter_log_prob,
                 )
             )
             episode_action_entropy_history.append(
@@ -1752,6 +1783,15 @@ def train_simulation():
             # 获取新边特征，并保持与当前观测相同的结构增强维度
             network.refresh_representations(detach=True)
             next_edge_features = network.get_edge_features(include_structural=True)
+            _, next_H_dyn_graph, _ = network.get_structure_and_dynamics_representation(detach=True)
+            next_Z_t_macro = network.get_macro_density()
+            next_macro_obs_counter, next_macro_obs_rumor = controller.build_macro_observations(
+                next_H_dyn_graph,
+                next_Z_t_macro,
+                all_suppress_actions,
+                all_rumor_actions,
+                network.fixed_edge_index,
+            )
 
             # 为每个智能体存储经验
             for agent_id in range(NUM_AGENTS):
@@ -1831,8 +1871,28 @@ def train_simulation():
                      subnet_suppress_reward, subnet_next_edge_features, all_suppress_values[agent_id]),
                     (subnet_edge_features, all_rumor_actions[agent_id], all_rumor_log_probs[agent_id],
                      subnet_rumor_reward, subnet_next_edge_features, all_rumor_values[agent_id]),
-                    (suppress_opp_action, rumor_opp_action)
+                    (suppress_opp_action, rumor_opp_action),
+                    terminal=(step == STEPS_PER_EPISODE - 1)
                 )
+
+            controller.store_macro_experience(
+                (
+                    macro_obs_counter.detach().clone(),
+                    macro_counter_action.detach().clone(),
+                    macro_counter_log_prob.detach().clone(),
+                    float(suppress_reward),
+                    next_macro_obs_counter.detach().clone(),
+                    float(step == STEPS_PER_EPISODE - 1),
+                ),
+                (
+                    macro_obs_rumor.detach().clone(),
+                    macro_rumor_action.detach().clone(),
+                    macro_rumor_log_prob.detach().clone(),
+                    float(rumor_reward),
+                    next_macro_obs_rumor.detach().clone(),
+                    float(step == STEPS_PER_EPISODE - 1),
+                ),
+            )
 
             # 第三阶段：同时更新Actor和对手模型
             # 更新对手模型

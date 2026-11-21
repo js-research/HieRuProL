@@ -92,7 +92,7 @@ def setup_fonts_safe():
         print(f"安全字体设置失败: {e}")
         return False
 
-# 初始化字体设置 - 使用安全版本
+
 font_success = setup_fonts_safe()
 if not font_success:
     print("使用最基本的字体配置")
@@ -400,7 +400,7 @@ class SWNetworkGenerator(nn.Module):
         """
         with torch.no_grad():
             # 动作映射：0-大幅减少, 1-小幅减少, 2-维持不变, 3-小幅增加, 4-大幅增加
-            action_effects = torch.tensor([0.5, 0.95, 1.0, 1.05, 1.5], device=device)
+            action_effects = torch.tensor([0.5, 0.75, 1.0, 1.25, 1.5], device=device)
 
             if edge_indices is None:
                 # 应用到所有边

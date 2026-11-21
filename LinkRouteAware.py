@@ -15,7 +15,7 @@ class LinkRouteAwareGNN(nn.Module):
         super().__init__()
         self.num_layers = num_layers
 
-        # 原始图转换层
+
         self.original_transform = nn.Linear(node_dim, hidden_dim)
 
         # 线图转换层

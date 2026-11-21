@@ -28,7 +28,7 @@ class GraphTransformer(nn.Module):
         self.beta = beta
         self.dropout = dropout
 
-        # 增强时间编码
+
         self.time_enc = AdaptiveTimeEncoding(output_dim=time_dim).to(device)
 
         # 动态位置编码维度 = 聚类系数(1) + k_hop路径特征

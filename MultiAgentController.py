@@ -8,8 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import copy
 import random
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal
 from collections import deque
 import numpy as np
 
@@ -33,6 +34,7 @@ class MacroActor(nn.Module):
             nn.Tanh()
         )
         self.register_buffer('action_scale', torch.tensor(0.1))
+        self.log_std = nn.Parameter(torch.full((param_dim,), -3.0))
 
     def forward(self, macro_obs):
         """
@@ -43,26 +45,41 @@ class MacroActor(nn.Module):
         delta_params = raw_action * self.action_scale
         return delta_params
 
+    def _distribution(self, macro_obs):
+        mean_action = self.forward(macro_obs)
+        std = self.log_std.clamp(-5.0, -1.0).exp().expand_as(mean_action)
+        return Normal(mean_action, std)
 
-# ==================== 集中式分布型评论家====================
-class DistributionalCritic(nn.Module):
-    """分位数评论家网络，输出K个分位数估计值"""
+    def sample(self, macro_obs):
+        """Sample a macro action and return its joint log-probability."""
+        distribution = self._distribution(macro_obs)
+        action = distribution.rsample()
+        log_prob = distribution.log_prob(action).sum(dim=-1)
+        return action, log_prob
 
-    def __init__(self, obs_dim, action_dim, num_quantiles=32, hidden_dim=256):
+    def log_prob(self, macro_obs, action):
+        """Evaluate log pi(a | o) at the action stored in the replay buffer."""
+        distribution = self._distribution(macro_obs)
+        return distribution.log_prob(action).sum(dim=-1)
+
+
+# ==================== 集中式 action-value 评论家 ====================
+class ActionValueCritic(nn.Module):
+    """Scalar action-value critic used by the paper's Actor-Critic equations."""
+
+    def __init__(self, obs_dim, action_dim, hidden_dim=256):
         super().__init__()
-        self.num_quantiles = num_quantiles
         self.net = nn.Sequential(
             nn.Linear(obs_dim + action_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_quantiles)
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, obs, action):
         # 拼接宏观观测与宏观动作
         x = torch.cat([obs, action], dim=-1)
-        # 输出每个样本的 num_quantiles 个分位数
         return self.net(x)
 
 
@@ -189,6 +206,13 @@ class Actor(nn.Module):
         input_dim = self.base_edge_dim + 2 * structural_dim
         self.communication = CommunicationModule(input_dim)
         self.edge_net = EdgeWisePolicyNetwork(input_dim, action_dim)
+        self.critic = nn.Sequential(
+            nn.Linear(node_state_dim + 1, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
         self.last_action_probs = None
 
     def _prepare_edge_features(self, edge_features):
@@ -255,7 +279,7 @@ class Actor(nn.Module):
             num_edges = edge_features.size(0)
 
             # 2. 定义离散动作空间分支
-            # 动作: 0.大幅减少(0.5强), 1.小幅减少(0.95弱), 2.维持不变(1.0中性), 3.小幅增加(1.05弱), 4.大幅增加(1.5强)
+            # 动作: 0.大幅减少(0.5强), 1.小幅减少(0.75弱), 2.维持不变(1.0中性), 3.小幅增加(1.25弱), 4.大幅增加(1.5强)
             action_idx_strong = [0, 4]  # 大幅调整动作
             action_idx_weak = [1, 3]  # 小幅调整动作
             action_idx_neutral = [2]  # 中性动作
@@ -503,6 +527,16 @@ class MultiAgentController:
                                 self.suppress_agents]
         self.rumor_optims = [optim.Adam(agent.parameters(), lr=lr, weight_decay=weight_decay) for agent in
                              self.rumor_agents]
+        self.critic_target_tau = 0.005
+        self.suppress_target_critics = [
+            copy.deepcopy(agent.critic).to(device) for agent in self.suppress_agents
+        ]
+        self.rumor_target_critics = [
+            copy.deepcopy(agent.critic).to(device) for agent in self.rumor_agents
+        ]
+        for target_critic in self.suppress_target_critics + self.rumor_target_critics:
+            for parameter in target_critic.parameters():
+                parameter.requires_grad_(False)
 
         # ===== 2. 宏观节点智能体 (Macro Actor) =====
         # 宏观观测输入
@@ -512,9 +546,14 @@ class MultiAgentController:
         self.macro_suppress_optim = optim.Adam(self.macro_suppress_actor.parameters(), lr=lr, weight_decay=weight_decay)
         self.macro_rumor_optim = optim.Adam(self.macro_rumor_actor.parameters(), lr=lr, weight_decay=weight_decay)
 
-        # ===== 3. 集中式分布型评论家 =====
-        self.macro_suppress_critic = DistributionalCritic(macro_obs_dim, self.macro_param_dim).to(device)
-        self.macro_rumor_critic = DistributionalCritic(macro_obs_dim, self.macro_param_dim).to(device)
+        # ===== 3. 集中式 action-value 评论家及其目标网络 =====
+        self.macro_suppress_critic = ActionValueCritic(macro_obs_dim, self.macro_param_dim).to(device)
+        self.macro_rumor_critic = ActionValueCritic(macro_obs_dim, self.macro_param_dim).to(device)
+        self.macro_suppress_target_critic = copy.deepcopy(self.macro_suppress_critic).to(device)
+        self.macro_rumor_target_critic = copy.deepcopy(self.macro_rumor_critic).to(device)
+        for target_critic in (self.macro_suppress_target_critic, self.macro_rumor_target_critic):
+            for parameter in target_critic.parameters():
+                parameter.requires_grad_(False)
         self.macro_critic_optims = [
             optim.Adam(self.macro_suppress_critic.parameters(), lr=lr),
             optim.Adam(self.macro_rumor_critic.parameters(), lr=lr)
@@ -587,6 +626,59 @@ class MultiAgentController:
         agg_values = agg_values / degrees
         return agg_values
 
+    def build_macro_observations(
+        self,
+        H_dyn_rep,
+        Z_t_macro,
+        suppress_actions,
+        rumor_actions,
+        edge_index,
+    ):
+        """Build the two network-level observations from a joint micro-action state."""
+        if isinstance(H_dyn_rep, torch.Tensor):
+            H_dyn_graph = H_dyn_rep.mean(dim=0) if H_dyn_rep.dim() > 1 else H_dyn_rep
+        else:
+            H_dyn_graph = torch.as_tensor(
+                H_dyn_rep, dtype=torch.float, device=device
+            ).mean(dim=0)
+        H_dyn_graph = H_dyn_graph.to(device).float().view(-1)
+        if H_dyn_graph.numel() < 4:
+            H_dyn_graph = F.pad(H_dyn_graph, (0, 4 - H_dyn_graph.numel()))
+        elif H_dyn_graph.numel() > 4:
+            H_dyn_graph = H_dyn_graph[:4]
+
+        if not isinstance(Z_t_macro, torch.Tensor):
+            Z_t_macro = torch.as_tensor(Z_t_macro, dtype=torch.float, device=device)
+        Z_t_macro = Z_t_macro.to(device).float().squeeze().view(-1)
+        if Z_t_macro.numel() < 4:
+            Z_t_macro = F.pad(Z_t_macro, (0, 4 - Z_t_macro.numel()))
+        elif Z_t_macro.numel() > 4:
+            Z_t_macro = Z_t_macro[:4]
+
+        flat_suppress_actions = []
+        flat_rumor_actions = []
+        flat_suppress_edges = []
+        flat_rumor_edges = []
+        for agent_id in range(self.num_agents):
+            subnet_edges = self.subnets[agent_id]['edges']
+            flat_suppress_actions.extend(suppress_actions[agent_id])
+            flat_rumor_actions.extend(rumor_actions[agent_id])
+            flat_suppress_edges.extend(subnet_edges)
+            flat_rumor_edges.extend(subnet_edges)
+
+        agg_suppress_vec = self._aggregate_micro_actions(
+            flat_suppress_actions, flat_suppress_edges, edge_index
+        )
+        agg_rumor_vec = self._aggregate_micro_actions(
+            flat_rumor_actions, flat_rumor_edges, edge_index
+        )
+        bar_A_counter_vec = agg_suppress_vec.mean().float().view(1).repeat(4)
+        bar_A_rumor_vec = agg_rumor_vec.mean().float().view(1).repeat(4)
+
+        macro_obs_counter = torch.cat([H_dyn_graph, Z_t_macro, bar_A_counter_vec])
+        macro_obs_rumor = torch.cat([H_dyn_graph, Z_t_macro, bar_A_rumor_vec])
+        return macro_obs_counter, macro_obs_rumor
+
     def get_actions(self, all_edge_features, H_dyn_rep, Z_t_macro, edge_index, critical_edges=None,difficulty_coefficient=0.5):
         """
         获取宏微观联合动作。
@@ -652,13 +744,6 @@ class MultiAgentController:
             self.observation_collector.update_observations(i, 1, subnet_edge_features, r_act, r_val)
 
         # 第二阶段：带通信的正式决策
-        flat_suppress_actions = []
-        flat_rumor_actions = []
-        flat_suppress_edges = []
-        flat_rumor_edges = []
-        total_suppress_edge_count = 0
-        total_rumor_edge_count = 0
-
         for i in range(self.num_agents):
             subnet_edge_features = self.get_subnet_edge_features(all_edge_features, i)
             if subnet_edge_features.size(0) == 0:
@@ -701,47 +786,34 @@ class MultiAgentController:
             all_suppress_values.append(s_val)
             all_rumor_values.append(r_val)
 
-            flat_suppress_actions.extend(s_act)
-            flat_rumor_actions.extend(r_act)
-            flat_suppress_edges.extend(subnet_edges)
-            flat_rumor_edges.extend(subnet_edges)
-            total_suppress_edge_count += len(s_act)
-            total_rumor_edge_count += len(r_act)
-
-        # ===== 3. 节点级聚合 =====
-        agg_suppress_vec = self._aggregate_micro_actions(flat_suppress_actions, flat_suppress_edges, edge_index)
-        agg_rumor_vec = self._aggregate_micro_actions(flat_rumor_actions, flat_rumor_edges, edge_index)
-
-        bar_A_counter = agg_suppress_vec.mean()
-        bar_A_rumor = agg_rumor_vec.mean()
-
-        # ===== 4. 宏观Actor输出 =====
-        bar_A_counter_vec = bar_A_counter.to(device).float().view(1).repeat(4)
-        bar_A_rumor_vec = bar_A_rumor.to(device).float().view(1).repeat(4)
-        macro_obs_counter = torch.cat([
-            H_dyn_graph,
+        # ===== 3. 节点级聚合与宏观 Actor 输出 =====
+        macro_obs_counter, macro_obs_rumor = self.build_macro_observations(
+            H_dyn_rep,
             Z_t_macro,
-            bar_A_counter_vec
-        ])
-        macro_obs_rumor = torch.cat([
-            H_dyn_graph,
-            Z_t_macro,
-            bar_A_rumor_vec
-        ])
-
-        macro_counter_action = self.macro_suppress_actor(macro_obs_counter.unsqueeze(0)).squeeze(0)
-        macro_rumor_action = self.macro_rumor_actor(macro_obs_rumor.unsqueeze(0)).squeeze(0)
+            all_suppress_actions,
+            all_rumor_actions,
+            edge_index,
+        )
+        with torch.no_grad():
+            macro_counter_action, macro_counter_log_prob = self.macro_suppress_actor.sample(
+                macro_obs_counter.unsqueeze(0)
+            )
+            macro_rumor_action, macro_rumor_log_prob = self.macro_rumor_actor.sample(
+                macro_obs_rumor.unsqueeze(0)
+            )
+            macro_counter_action = macro_counter_action.squeeze(0)
+            macro_rumor_action = macro_rumor_action.squeeze(0)
 
         return (all_suppress_actions, all_rumor_actions,
                 all_suppress_log_probs, all_rumor_log_probs,
                 all_suppress_opp_probs, all_rumor_opp_probs,
                 all_suppress_values, all_rumor_values,
                 macro_obs_counter, macro_obs_rumor,
-                macro_counter_action, macro_rumor_action)
+                macro_counter_action, macro_rumor_action,
+                macro_counter_log_prob.squeeze(0), macro_rumor_log_prob.squeeze(0))
 
-    def store_experience(self, agent_id, suppress_exp, rumor_exp, opp_actions, macro_exp_counter=None,
-                         macro_exp_rumor=None):
-        """存储经验：兼容微观经验与宏观经验"""
+    def store_experience(self, agent_id, suppress_exp, rumor_exp, opp_actions, terminal=False):
+        """Store one community-level transition for both role-specific agents."""
         suppress_opp_action = opp_actions[0]
         rumor_opp_action = opp_actions[1]
         self.total_experiences += 1
@@ -764,7 +836,8 @@ class MultiAgentController:
                     suppress_exp[2],
                     suppress_exp[3],
                     suppress_exp[4],
-                    suppress_val
+                    suppress_val,
+                    float(terminal)
                 ))
                 self.rumor_memories[agent_id].append((
                     rumor_exp[0],
@@ -772,7 +845,8 @@ class MultiAgentController:
                     rumor_exp[2],
                     rumor_exp[3],
                     rumor_exp[4],
-                    rumor_val
+                    rumor_val,
+                    float(terminal)
                 ))
 
                 valid_suppress_opp = [a for a in suppress_opp_action if 0 <= a < 5]
@@ -784,18 +858,16 @@ class MultiAgentController:
                     self.rumor_opp_memory.append(
                         (rumor_exp[0], torch.tensor(valid_rumor_opp, dtype=torch.long, device=device)))
 
-        if macro_exp_counter is not None:
-            obs_m, act_m, rew_m, next_obs_m = macro_exp_counter
-            self.macro_suppress_memory.append((obs_m, act_m, rew_m, next_obs_m))
-        if macro_exp_rumor is not None:
-            obs_m, act_m, rew_m, next_obs_m = macro_exp_rumor
-            self.macro_rumor_memory.append((obs_m, act_m, rew_m, next_obs_m))
-
         if self.opp_update_counter % 2 == 0:
             opp_loss1, opp_loss2 = self.update_opponent_models(batch_size=32)
             return opp_loss1, opp_loss2
         self.opp_update_counter += 1
         return 0.0, 0.0
+
+    def store_macro_experience(self, suppress_exp, rumor_exp):
+        """Store one network-level transition for each role."""
+        self.macro_suppress_memory.append(tuple(suppress_exp))
+        self.macro_rumor_memory.append(tuple(rumor_exp))
 
     def update_opponent_models(self, batch_size=64):
         if self.freeze_opponent_models:
@@ -846,70 +918,110 @@ class MultiAgentController:
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
         self.episode_count += 1
 
-    def quantile_huber_loss(self, pred_quantiles, target_quantiles, taus):
-        """
-        公式 (43): 分位数 Huber 损失计算
-        """
-        error = target_quantiles - pred_quantiles
-        huber = torch.where(error.abs() <= 1.0, 0.5 * error.pow(2), error.abs() - 0.5)
-        rho = torch.abs(taus - (error < 0).float())
-        return (rho * huber).mean()
+    def _soft_update(self, target_network, online_network):
+        with torch.no_grad():
+            for target_parameter, online_parameter in zip(
+                target_network.parameters(), online_network.parameters()
+            ):
+                target_parameter.mul_(1.0 - self.critic_target_tau)
+                target_parameter.add_(online_parameter, alpha=self.critic_target_tau)
+
+    def _community_value(self, critic, edge_features, agent_type):
+        mean_node_state = edge_features[:, :self.node_state_dim].mean(dim=0)
+        agent_type_tensor = torch.tensor([agent_type], device=edge_features.device)
+        critic_input = torch.cat([mean_node_state, agent_type_tensor])
+        return critic(critic_input.unsqueeze(0))
+
+    def _update_macro_team(
+        self,
+        actor,
+        critic,
+        target_critic,
+        actor_optimizer,
+        critic_optimizer,
+        memory,
+        batch_size,
+    ):
+        """One-step Actor-Critic update for a network-level role."""
+        if len(memory) < batch_size:
+            return 0.0, 0.0, 0.0
+
+        indices = random.sample(range(len(memory)), batch_size)
+        batch = [memory[index] for index in indices]
+        obs, actions, _, rewards, next_obs, dones = zip(*batch)
+        obs = torch.stack(obs).to(device)
+        actions = torch.stack(actions).to(device)
+        rewards = torch.as_tensor(rewards, dtype=torch.float, device=device).unsqueeze(-1)
+        next_obs = torch.stack(next_obs).to(device)
+        dones = torch.as_tensor(dones, dtype=torch.float, device=device).unsqueeze(-1)
+
+        with torch.no_grad():
+            next_actions = actor(next_obs)
+            next_values = target_critic(next_obs, next_actions)
+            td_targets = rewards + self.gamma * (1.0 - dones) * next_values
+
+        current_values = critic(obs, actions)
+        # Eq. (34): optimize the mean squared TD error for the Critic.
+        critic_loss = F.mse_loss(current_values, td_targets.detach())
+
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+        critic_optimizer.step()
+
+        # Re-evaluate the stored action under the current policy. Using a newly
+        # sampled action here would pair log pi(a_new | s) with TD(s, a_old).
+        current_log_probs = actor.log_prob(obs, actions)
+        advantages = (td_targets - current_values.detach()).clamp(-10.0, 10.0)
+        # Eq. (35): policy-gradient update evaluated at the stored transition.
+        actor_loss = -(current_log_probs.unsqueeze(-1) * advantages).mean()
+
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(actor.parameters(), 0.5)
+        actor_optimizer.step()
+
+        self._soft_update(target_critic, critic)
+        return actor_loss.item(), critic_loss.item(), advantages.mean().item()
 
     def update_agents(self, batch_size=32):
         """
-        集中式分布型评论家更新，宏观策略更新，以及宏观优势向微观策略的传递。
+        Actor-Critic updates for network-level actors and their community-level
+        policy transfer using the paper's top-down credit assignment.
         """
         if self.freeze_actor_models:
             return 0, 0
 
-        total_suppress_loss = 0
-        total_rumor_loss = 0
+        total_suppress_loss = 0.0
+        total_rumor_loss = 0.0
         updated_agents = 0
 
         # ====================================================
-        # 1. 宏观层更新 
+        # 1. Network-level Actor-Critic updates
         # ====================================================
-        if len(self.macro_suppress_memory) >= batch_size:
-            indices = random.sample(range(len(self.macro_suppress_memory)), batch_size)
-            macro_batch = [self.macro_suppress_memory[i] for i in indices]
-            m_obs, m_act, m_rew, m_next_obs = zip(*macro_batch)
-            m_obs = torch.stack(m_obs)
-            m_act = torch.stack(m_act)
-            m_rew = torch.tensor(m_rew, device=device).unsqueeze(-1)
-            m_next_obs = torch.stack(m_next_obs)
-
-            # 更新评论家
-            with torch.no_grad():
-                next_actions = self.macro_suppress_actor(m_next_obs)
-                next_quantiles = self.macro_suppress_critic(m_next_obs, next_actions)
-                target_quantiles = m_rew + self.gamma * next_quantiles
-
-            curr_quantiles = self.macro_suppress_critic(m_obs, m_act)
-            taus = torch.linspace(0.01, 0.99, self.macro_suppress_critic.num_quantiles).to(device)
-            critic_loss = self.quantile_huber_loss(curr_quantiles, target_quantiles, taus)
-
-            self.macro_critic_optims[0].zero_grad()
-            critic_loss.backward()
-            nn.utils.clip_grad_norm_(self.macro_suppress_critic.parameters(), 0.5)
-            self.macro_critic_optims[0].step()
-
-            # 更新宏观 Actor
-            # 计算全局优势 A_global = E[Z] - V_baseline
-            mean_quantile_val = curr_quantiles.mean(dim=-1)
-            baseline_val = self.macro_suppress_critic(m_obs, torch.zeros_like(m_act)).mean(dim=-1)
-            global_advantage = mean_quantile_val - baseline_val
-
-            # 宏观策略梯度
-            log_prob = -F.mse_loss(m_act, self.macro_suppress_actor(m_obs), reduction='none').sum(dim=-1)
-            macro_policy_loss = -(log_prob * global_advantage.detach()).mean()
-
-            self.macro_suppress_optim.zero_grad()
-            macro_policy_loss.backward()
-            nn.utils.clip_grad_norm_(self.macro_suppress_actor.parameters(), 0.5)
-            self.macro_suppress_optim.step()
+        macro_s_actor_loss, macro_s_critic_loss, macro_s_advantage = self._update_macro_team(
+            self.macro_suppress_actor,
+            self.macro_suppress_critic,
+            self.macro_suppress_target_critic,
+            self.macro_suppress_optim,
+            self.macro_critic_optims[0],
+            self.macro_suppress_memory,
+            batch_size,
+        )
+        macro_r_actor_loss, macro_r_critic_loss, macro_r_advantage = self._update_macro_team(
+            self.macro_rumor_actor,
+            self.macro_rumor_critic,
+            self.macro_rumor_target_critic,
+            self.macro_rumor_optim,
+            self.macro_critic_optims[1],
+            self.macro_rumor_memory,
+            batch_size,
+        )
+        total_suppress_loss += macro_s_actor_loss + macro_s_critic_loss
+        total_rumor_loss += macro_r_actor_loss + macro_r_critic_loss
 
         # ====================================================
-        # 2. 微观层更新以及优势回传
+        # 2. Community-level updates with top-down credit assignment
         # ====================================================
         total_omega = sum(self.subnet_node_counts)
         for agent_id in range(self.num_agents):
@@ -927,39 +1039,36 @@ class MultiAgentController:
             s_policy_loss = 0
             s_value_loss = 0
             for exp in suppress_batch:
-                edge_feat, action, log_prob, reward, next_edge_feat, state_value = exp
+                edge_feat, action, _, reward, next_edge_feat, state_value, terminal = exp
                 edge_feat = edge_feat.to(device)
                 next_edge_feat = next_edge_feat.to(device)
                 action = action.to(device)
-                log_prob = log_prob.to(device)
 
                 new_probs, new_state_value = self.suppress_agents[agent_id](edge_feat)
                 new_dist = Categorical(new_probs)
                 new_log_prob = new_dist.log_prob(action)
 
                 with torch.no_grad():
-                    _, next_state_value = self.suppress_agents[agent_id](next_edge_feat)
-                    td_target = reward + self.gamma * next_state_value * 0.99
+                    next_state_value = self._community_value(
+                        self.suppress_target_critics[agent_id], next_edge_feat, agent_type=0
+                    )
+                    td_target = reward + self.gamma * (1.0 - terminal) * next_state_value
                     td_target = torch.clamp(td_target, -10.0, 10.0)
 
-                advantage = td_target.squeeze() - state_value
-
-                community_advantage = advantage * omega_k
-
-                ratio = (new_log_prob - log_prob).exp()
-                clipped_ratio = torch.clamp(ratio, 0.8, 1.2)
-                policy_loss = -torch.min(ratio * community_advantage, clipped_ratio * community_advantage)
+                advantage = td_target.squeeze() - float(state_value)
+                community_advantage = (advantage + macro_s_advantage) * omega_k
+                policy_loss = -(new_log_prob * community_advantage.detach()).mean()
 
                 new_state_val_squeezed = new_state_value.squeeze()
                 td_target_squeezed = td_target.detach().squeeze()
                 if new_state_val_squeezed.dim() == 0 and td_target_squeezed.dim() == 0:
-                    value_loss = F.smooth_l1_loss(new_state_val_squeezed, td_target_squeezed)
+                    value_loss = F.mse_loss(new_state_val_squeezed, td_target_squeezed)
                 else:
                     if new_state_val_squeezed.dim() == 0:
                         new_state_val_squeezed = new_state_val_squeezed.unsqueeze(0)
                     if td_target_squeezed.dim() == 0:
                         td_target_squeezed = td_target_squeezed.unsqueeze(0)
-                    value_loss = F.smooth_l1_loss(new_state_val_squeezed, td_target_squeezed)
+                    value_loss = F.mse_loss(new_state_val_squeezed, td_target_squeezed)
 
                 s_policy_loss += policy_loss.mean()
                 s_value_loss += value_loss
@@ -969,44 +1078,45 @@ class MultiAgentController:
             total_s_loss_batch.backward()
             nn.utils.clip_grad_norm_(self.suppress_agents[agent_id].parameters(), 0.5)
             self.suppress_optims[agent_id].step()
+            self._soft_update(
+                self.suppress_target_critics[agent_id], self.suppress_agents[agent_id].critic
+            )
             total_suppress_loss += total_s_loss_batch.item()
 
             # 更新微观传谣智能体
             r_policy_loss = 0
             r_value_loss = 0
             for exp in rumor_batch:
-                edge_feat, action, log_prob, reward, next_edge_feat, state_value = exp
+                edge_feat, action, _, reward, next_edge_feat, state_value, terminal = exp
                 edge_feat = edge_feat.to(device)
                 next_edge_feat = next_edge_feat.to(device)
                 action = action.to(device)
-                log_prob = log_prob.to(device)
 
                 new_probs, new_state_value = self.rumor_agents[agent_id](edge_feat)
                 new_dist = Categorical(new_probs)
                 new_log_prob = new_dist.log_prob(action)
 
                 with torch.no_grad():
-                    _, next_state_value = self.rumor_agents[agent_id](next_edge_feat)
-                    td_target = reward + self.gamma * next_state_value * 0.99
+                    next_state_value = self._community_value(
+                        self.rumor_target_critics[agent_id], next_edge_feat, agent_type=1
+                    )
+                    td_target = reward + self.gamma * (1.0 - terminal) * next_state_value
                     td_target = torch.clamp(td_target, -10.0, 10.0)
 
-                advantage = td_target.squeeze() - state_value
-                community_advantage = advantage * omega_k
-
-                ratio = (new_log_prob - log_prob).exp()
-                clipped_ratio = torch.clamp(ratio, 0.8, 1.2)
-                policy_loss = -torch.min(ratio * community_advantage, clipped_ratio * community_advantage)
+                advantage = td_target.squeeze() - float(state_value)
+                community_advantage = (advantage + macro_r_advantage) * omega_k
+                policy_loss = -(new_log_prob * community_advantage.detach()).mean()
 
                 new_state_val_squeezed = new_state_value.squeeze()
                 td_target_squeezed = td_target.detach().squeeze()
                 if new_state_val_squeezed.dim() == 0 and td_target_squeezed.dim() == 0:
-                    value_loss = F.smooth_l1_loss(new_state_val_squeezed, td_target_squeezed)
+                    value_loss = F.mse_loss(new_state_val_squeezed, td_target_squeezed)
                 else:
                     if new_state_val_squeezed.dim() == 0:
                         new_state_val_squeezed = new_state_val_squeezed.unsqueeze(0)
                     if td_target_squeezed.dim() == 0:
                         td_target_squeezed = td_target_squeezed.unsqueeze(0)
-                    value_loss = F.smooth_l1_loss(new_state_val_squeezed, td_target_squeezed)
+                    value_loss = F.mse_loss(new_state_val_squeezed, td_target_squeezed)
 
                 r_policy_loss += policy_loss.mean()
                 r_value_loss += value_loss
@@ -1016,12 +1126,15 @@ class MultiAgentController:
             total_r_loss_batch.backward()
             nn.utils.clip_grad_norm_(self.rumor_agents[agent_id].parameters(), 0.5)
             self.rumor_optims[agent_id].step()
+            self._soft_update(
+                self.rumor_target_critics[agent_id], self.rumor_agents[agent_id].critic
+            )
             total_rumor_loss += total_r_loss_batch.item()
 
             updated_agents += 1
 
         if updated_agents == 0:
-            return 0, 0
+            return total_suppress_loss, total_rumor_loss
         return total_suppress_loss / updated_agents, total_rumor_loss / updated_agents
 
     def state_dict(self):
@@ -1085,6 +1198,20 @@ class MultiAgentController:
             self.rumor_agents[i].load_state_dict(agent_state)
         self.macro_suppress_actor.load_state_dict(state_dict['macro_suppress_actor'])
         self.macro_rumor_actor.load_state_dict(state_dict['macro_rumor_actor'])
+        for online_agent, target_critic in zip(
+            self.suppress_agents, self.suppress_target_critics
+        ):
+            target_critic.load_state_dict(online_agent.critic.state_dict())
+        for online_agent, target_critic in zip(
+            self.rumor_agents, self.rumor_target_critics
+        ):
+            target_critic.load_state_dict(online_agent.critic.state_dict())
+        self.macro_suppress_target_critic.load_state_dict(
+            self.macro_suppress_critic.state_dict()
+        )
+        self.macro_rumor_target_critic.load_state_dict(
+            self.macro_rumor_critic.state_dict()
+        )
         for i, optim_state in enumerate(state_dict['suppress_optims']):
             self.suppress_optims[i].load_state_dict(optim_state)
         for i, optim_state in enumerate(state_dict['rumor_optims']):
