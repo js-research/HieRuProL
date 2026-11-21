@@ -189,6 +189,7 @@ class Actor(nn.Module):
         input_dim = self.base_edge_dim + 2 * structural_dim
         self.communication = CommunicationModule(input_dim)
         self.edge_net = EdgeWisePolicyNetwork(input_dim, action_dim)
+        self.last_action_probs = None
 
     def _prepare_edge_features(self, edge_features):
         """兼容 9 维旧边特征与 17 维结构增强边特征。"""
@@ -292,6 +293,7 @@ class Actor(nn.Module):
 
             # 统一归一化，保证概率和为1
             final_probs = weighted_probs / (weighted_probs.sum(dim=-1, keepdim=True) + 1e-8)
+            self.last_action_probs = final_probs.detach().clone()
 
             # 4. 根据新的概率分布采样动作
             actions = []

@@ -5,6 +5,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 import gc
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -110,6 +111,263 @@ def calculate_distribution_similarity(pred_probs, true_actions, action_dim=5):
     similarity = 1.0 - js_distance
     
     return similarity, true_distribution, pred_distribution
+
+
+CONVERGENCE_EPSILON = 1e-5
+CONVERGENCE_WINDOW = 3
+LE_PERTURBATION_EPSILON = 1e-6
+MACRO_ACTION_SCALE = 0.1
+
+
+def _reset_network_for_metric_replay(network, initial_states):
+    """Restore the dynamic state so that all metrics use the same episode trajectory."""
+    network.node_states = initial_states.detach().clone()
+    network.fixed_edge_index = network.initial_edge_index.clone()
+    network.edge_weights = torch.ones(
+        network.initial_num_edges, device=network.node_states.device
+    )
+    network.num_edges = network.initial_num_edges
+    network.time_step = 0
+
+    for buffer_name in (
+        'delta_beta',
+        'delta_beta_SI',
+        'delta_alpha_S',
+        'delta_alpha_SC',
+        'delta_delta_I',
+        'delta_delta_IC',
+    ):
+        if hasattr(network, buffer_name):
+            getattr(network, buffer_name).zero_()
+
+
+def _snapshot_network_state(network):
+    """Capture the controllable network state at the end of a replay."""
+    snapshot = {
+        'node_states': network.node_states.detach().clone(),
+        'fixed_edge_index': network.fixed_edge_index.detach().clone(),
+        'edge_weights': network.edge_weights.detach().clone(),
+        'num_edges': network.num_edges,
+        'time_step': network.time_step,
+    }
+    for buffer_name in (
+        'delta_beta',
+        'delta_beta_SI',
+        'delta_alpha_S',
+        'delta_alpha_SC',
+        'delta_delta_I',
+        'delta_delta_IC',
+    ):
+        if hasattr(network, buffer_name):
+            snapshot[buffer_name] = getattr(network, buffer_name).detach().clone()
+    return snapshot
+
+
+def _restore_network_state(network, snapshot):
+    """Restore a previously captured network state without a new network reset."""
+    network.node_states = snapshot['node_states'].detach().clone()
+    network.fixed_edge_index = snapshot['fixed_edge_index'].detach().clone()
+    network.edge_weights = snapshot['edge_weights'].detach().clone()
+    network.num_edges = snapshot['num_edges']
+    network.time_step = snapshot['time_step']
+    for buffer_name in (
+        'delta_beta',
+        'delta_beta_SI',
+        'delta_alpha_S',
+        'delta_alpha_SC',
+        'delta_delta_I',
+        'delta_delta_IC',
+    ):
+        if buffer_name in snapshot and hasattr(network, buffer_name):
+            target = getattr(network, buffer_name)
+            target.copy_(snapshot[buffer_name])
+
+
+def _perturb_initial_sicr_states(initial_states, epsilon=LE_PERTURBATION_EPSILON):
+    """Apply a small, deterministic perturbation to the infected-state probability."""
+    perturbed = initial_states.detach().clone()
+    perturbed[:, 1] = torch.clamp(perturbed[:, 1] + epsilon, 0.0, 1.0)
+    perturbed = perturbed / (perturbed.sum(dim=1, keepdim=True) + 1e-12)
+    return perturbed
+
+
+def _replay_density_trajectory(network, initial_states, action_trace):
+    """Replay one controlled episode with the recorded actions."""
+    with torch.no_grad():
+        _reset_network_for_metric_replay(network, initial_states)
+        density_trajectory = [
+            network.node_states.mean(dim=0).detach().cpu().numpy().astype(np.float64)
+        ]
+
+        for action_record in action_trace:
+            network.apply_actions(
+                action_record['suppress_actions'],
+                action_record['rumor_actions'],
+                action_record['edge_indices'],
+            )
+            network.step(macro_actions=action_record['macro_actions'])
+            density_trajectory.append(
+                network.node_states.mean(dim=0).detach().cpu().numpy().astype(np.float64)
+            )
+
+        terminal_states = network.node_states.detach().clone()
+        terminal_network_state = _snapshot_network_state(network)
+        return (
+            np.asarray(density_trajectory, dtype=np.float64),
+            terminal_states,
+            terminal_network_state,
+        )
+
+
+def compute_finite_horizon_le(network, initial_states, action_trace):
+    if not action_trace:
+        return (
+            0.0,
+            np.zeros((1, 4), dtype=np.float64),
+            np.zeros(1, dtype=np.float64),
+            initial_states.detach().clone(),
+        )
+
+    reference_density, reference_terminal, reference_network_state = _replay_density_trajectory(
+        network, initial_states, action_trace
+    )
+    perturbed_density, _, _ = _replay_density_trajectory(
+        network,
+        _perturb_initial_sicr_states(initial_states),
+        action_trace,
+    )
+    _restore_network_state(network, reference_network_state)
+
+    density_delta = perturbed_density - reference_density
+    initial_norm = float(np.linalg.norm(density_delta[0]))
+    terminal_norm = float(np.linalg.norm(density_delta[-1]))
+    horizon = max(len(action_trace), 1)
+    le_value = math.log(
+        max(terminal_norm, 1e-30) / max(initial_norm, 1e-30)
+    ) / horizon
+
+    le_prefix = []
+    for step in range(1, len(density_delta)):
+        prefix_norm = float(np.linalg.norm(density_delta[step]))
+        le_prefix.append(
+            math.log(max(prefix_norm, 1e-30) / max(initial_norm, 1e-30)) / step
+        )
+
+    return le_value, reference_density, np.asarray(le_prefix), reference_terminal
+
+
+def compute_convergence_time(infection_trajectory):
+    trajectory = np.asarray(infection_trajectory, dtype=np.float64).reshape(-1)
+    horizon = max(len(trajectory) - 1, 0)
+    if len(trajectory) < CONVERGENCE_WINDOW:
+        return horizon
+
+    for start in range(len(trajectory) - CONVERGENCE_WINDOW + 1):
+        window = trajectory[start:start + CONVERGENCE_WINDOW]
+        if np.all(window <= CONVERGENCE_EPSILON):
+            return min(start, horizon)
+    return horizon
+
+
+def compute_steady_state_error(terminal_states):
+    infection_component = terminal_states[:, 1].detach().float()
+    node_norm = torch.linalg.vector_norm(infection_component, ord=2).item()
+    density_norm = abs(infection_component.mean().item())
+    return node_norm + density_norm
+
+
+def compute_action_entropy(policy_probabilities):
+    entropies = []
+    for probabilities in policy_probabilities:
+        if probabilities is None or probabilities.numel() == 0:
+            continue
+        probs = probabilities.detach().float()
+        if probs.ndim == 2:
+            probs = probs.mean(dim=0)
+        probs = probs / (probs.sum() + 1e-12)
+        entropy = -(probs * torch.log(probs + 1e-12)).sum().item()
+        entropies.append(entropy)
+    return float(np.mean(entropies)) if entropies else 0.0
+
+
+def compute_policy_probability_cost(
+    policy_probabilities,
+    selected_actions,
+    selected_log_probs,
+    macro_debunking_action,
+):
+    community_cost = 0.0
+    for probabilities, actions, log_probs in zip(
+        policy_probabilities, selected_actions, selected_log_probs
+    ):
+        if not actions:
+            continue
+
+        if probabilities is not None and probabilities.numel() > 0:
+            probs = probabilities.detach().float()
+            num_actions = min(probs.size(0), len(actions))
+            if num_actions > 0:
+                action_indices = torch.as_tensor(
+                    actions[:num_actions], dtype=torch.long, device=probs.device
+                )
+                active_probs = probs[
+                    torch.arange(num_actions, device=probs.device), action_indices
+                ]
+                community_cost += active_probs.sum().item()
+        elif log_probs is not None and log_probs.numel() > 0:
+            community_cost += torch.exp(log_probs.detach().float()).sum().item()
+
+    if macro_debunking_action is None:
+        network_cost = 0.0
+    else:
+        normalized_macro_action = (
+            torch.abs(macro_debunking_action.detach().float()) / MACRO_ACTION_SCALE
+        )
+        network_cost = torch.sigmoid(normalized_macro_action).sum().item()
+
+    return community_cost + network_cost
+
+
+def finalize_episode_metrics(
+    network,
+    initial_states,
+    action_trace,
+    policy_cost_history,
+    action_entropy_history,
+):
+    le_value, density_trajectory, le_prefix, terminal_states = compute_finite_horizon_le(
+        network, initial_states, action_trace
+    )
+    infection_trajectory = density_trajectory[:, 1]
+
+    convergence_time = compute_convergence_time(infection_trajectory)
+    steady_state_error = compute_steady_state_error(terminal_states)
+    peak_infection_density = float(np.max(infection_trajectory[1:])) if len(infection_trajectory) > 1 else 0.0
+
+    num_transitions = min(len(policy_cost_history), max(len(infection_trajectory) - 1, 0))
+    fv_steps = []
+    idr_uc_steps = []
+    for step in range(num_transitions):
+        infection_drop = float(infection_trajectory[step] - infection_trajectory[step + 1])
+        policy_cost = policy_cost_history[step]
+        fv_steps.append(infection_drop)
+        idr_uc_steps.append(infection_drop / max(policy_cost, 1e-12))
+
+    return {
+        'LE': float(le_value),
+        'CT': int(convergence_time),
+        'SSE': float(steady_state_error),
+        'FV': float(np.mean(fv_steps)) if fv_steps else 0.0,
+        'IDR_UC': float(np.mean(idr_uc_steps)) if idr_uc_steps else 0.0,
+        'PE': peak_infection_density,
+        'AE': float(np.mean(action_entropy_history)) if action_entropy_history else 0.0,
+        'le_prefix': le_prefix,
+        'fv_steps': fv_steps,
+        'idr_uc_steps': idr_uc_steps,
+        'pe_steps': infection_trajectory[1:].astype(np.float64),
+        'ae_steps': list(action_entropy_history),
+    }
+
 
 def compute_structure_loss(h_v, edge_index, num_nodes):
         """
@@ -519,6 +777,7 @@ def train_simulation():
     for episode in range(EPISODES):
         # 重置节点状态 (网络结构保持不变)
         network.reset(INIT_INFECTION, INIT_COUNTER)
+        episode_initial_states = network.node_states.detach().clone()
 
         # 重置最大感染率
         MAX_INFECTION_RATE = 0.0
@@ -578,6 +837,9 @@ def train_simulation():
         # 记录动作历史用于C2指标计算
         suppress_actions_history = []
         rumor_actions_history = []
+        episode_action_trace = []
+        episode_policy_cost_history = []
+        episode_action_entropy_history = []
 
         for step in range(STEPS_PER_EPISODE):
             # 刷新 H_struct 与 H_dyn，并构造结构增强后的边特征
@@ -627,6 +889,12 @@ def train_simulation():
 
             # 单步传播更新节点状态，宏动作以两队差值作用于动力学参数
             macro_actions = macro_counter_action - macro_rumor_action
+            episode_action_trace.append({
+                'suppress_actions': list(suppress_actions),
+                'rumor_actions': list(rumor_actions),
+                'edge_indices': list(applied_edge_indices),
+                'macro_actions': macro_actions.detach().clone(),
+            })
             infection_rate, counter_rate = network.step(macro_actions=macro_actions)
             avg_infection += infection_rate
             avg_counter += counter_rate
@@ -758,80 +1026,26 @@ def train_simulation():
             episode_suppress_opp_acc.append(suppress_acc)  # 按角色记录
             episode_rumor_opp_acc.append(rumor_acc)        # 按角色记录
 
-            # ==================== 新增：计算C1和C2指标 ====================
-            # 计算Lyapunov指数(LE)
-            if len(episode_infections) > 1:
-                le = np.mean(np.diff(np.log(np.array(episode_infections) + 1e-10)))
-                episode_c1_le.append(le)
-
-            # 计算稳态误差(SSE)
-            target_infection = 0.0
-            sse = abs(infection_rate - target_infection)
-            episode_c1_sse.append(sse)
-
-            # 计算感染峰值下降速度(FV)
-            peak_infection = max(episode_infections) if episode_infections else 0
-            fv = (peak_infection - infection_rate) / (len(episode_infections) + 1e-10)
-            episode_c2_fv.append(fv)
-
-            # 计算单位成本感染下降率(IDR_UC)
-            all_suppress_actions_flat = [action for step_actions in suppress_actions_history for action in step_actions]
-            all_rumor_actions_flat = [action for step_actions in rumor_actions_history for action in step_actions]
-
-            if all_suppress_actions_flat and all_rumor_actions_flat:
-                total_action_cost = np.mean(all_suppress_actions_flat) + np.mean(all_rumor_actions_flat)
-            else:
-                total_action_cost = 0
-            idr_uc = (INIT_INFECTION - infection_rate) / (total_action_cost + 1e-10)
-            episode_c2_idr_uc.append(idr_uc)
-
-            # 计算传播范围(PE)
-            ir_count = 0
-            for node_state in network.node_states:
-                if node_state[1] > 0.5 or node_state[3] > 0.5:
-                    ir_count += 1
-            pe = ir_count / len(network.node_states)
-            episode_c2_pe.append(pe)
-
-            # 计算策略动作熵(AE)
-            def calculate_entropy(probs_list):
-                total_entropy = 0
-                total_count = 0
-                for probs in probs_list:
-                    if len(probs) == 0:
-                        continue
-                    if probs.ndim == 1:
-                        probs = probs.reshape(1, -1)
-                    entropy = -np.sum(probs * np.log(probs + 1e-10), axis=-1)
-                    if isinstance(entropy, np.ndarray):
-                        total_entropy += np.sum(entropy)
-                        total_count += len(entropy)
-                    else:
-                        total_entropy += entropy
-                        total_count += 1
-                return total_entropy / total_count if total_count > 0 else 0
-
-            # 计算所有智能体的动作概率熵
-            suppress_entropies = []
-            rumor_entropies = []
-            
+            # Collect policy-implied costs and action entropy for Eq. (A.10) and Eq. (A.14).
+            suppress_policy_probabilities = []
             for i in range(NUM_AGENTS):
-                if len(all_suppress_log_probs[i]) > 0:
-                    suppress_probs = torch.softmax(all_suppress_log_probs[i], dim=-1)
-                    suppress_entropy = calculate_entropy([suppress_probs.cpu().detach().numpy()])
-                    suppress_entropies.append(suppress_entropy)
-                
-                if len(all_rumor_log_probs[i]) > 0:
-                    rumor_probs = torch.softmax(all_rumor_log_probs[i], dim=-1)
-                    rumor_entropy = calculate_entropy([rumor_probs.cpu().detach().numpy()])
-                    rumor_entropies.append(rumor_entropy)
+                probabilities = getattr(controller.suppress_agents[i], 'last_action_probs', None)
+                if probabilities is None or probabilities.numel() == 0:
+                    suppress_policy_probabilities.append(None)
+                else:
+                    suppress_policy_probabilities.append(probabilities.detach().clone())
 
-            avg_suppress_entropy = np.mean(suppress_entropies) if suppress_entropies else 0
-            avg_rumor_entropy = np.mean(rumor_entropies) if rumor_entropies else 0
-            ae = (avg_suppress_entropy + avg_rumor_entropy) / 2
-            episode_c2_ae.append(ae)
-
-            # ==================== 指标计算结束 ====================
+            episode_policy_cost_history.append(
+                compute_policy_probability_cost(
+                    suppress_policy_probabilities,
+                    all_suppress_actions,
+                    all_suppress_log_probs,
+                    macro_counter_action,
+                )
+            )
+            episode_action_entropy_history.append(
+                compute_action_entropy(suppress_policy_probabilities)
+            )
 
             # 获取新边特征，并保持与当前观测相同的结构增强维度
             network.refresh_representations(detach=True)
@@ -967,24 +1181,31 @@ def train_simulation():
         episode_data['action_distributions']['rumor_pred'].append(avg_episode_rumor_pred)
         episode_data['action_distributions']['rumor_true'].append(avg_episode_rumor_true)
 
-        # ==================== 新增：保存C1和C2指标 ====================
-        # 计算收敛时间(CT)
-        conv_time = STEPS_PER_EPISODE
-        for i, inf_rate in enumerate(episode_infections):
-            if inf_rate <= 0.05:  # 感染率低于5%认为收敛
-                conv_time = i
-                break
+        # ==================== 保存Appendices A.2-A.3定义的C1/C2指标 ====================
+        episode_metrics = finalize_episode_metrics(
+            network,
+            episode_initial_states,
+            episode_action_trace,
+            episode_policy_cost_history,
+            episode_action_entropy_history,
+        )
+        conv_time = episode_metrics['CT']
 
-        # 保存C1指标
-        episode_data['c1_metrics']['LE'].append(np.mean(episode_c1_le) if episode_c1_le else 0)
-        episode_data['c1_metrics']['CT'].append(conv_time)
-        episode_data['c1_metrics']['SSE'].append(np.mean(episode_c1_sse) if episode_c1_sse else 0)
+        episode_c1_le = list(episode_metrics['le_prefix'])
+        episode_c1_sse = [episode_metrics['SSE']]
+        episode_c2_fv = list(episode_metrics['fv_steps'])
+        episode_c2_idr_uc = list(episode_metrics['idr_uc_steps'])
+        episode_c2_pe = list(episode_metrics['pe_steps'])
+        episode_c2_ae = list(episode_metrics['ae_steps'])
 
-        # 保存C2指标
-        episode_data['c2_metrics']['FV'].append(np.mean(episode_c2_fv) if episode_c2_fv else 0)
-        episode_data['c2_metrics']['IDR_UC'].append(np.mean(episode_c2_idr_uc) if episode_c2_idr_uc else 0)
-        episode_data['c2_metrics']['PE'].append(np.mean(episode_c2_pe) if episode_c2_pe else 0)
-        episode_data['c2_metrics']['AE'].append(np.mean(episode_c2_ae) if episode_c2_ae else 0)
+        episode_data['c1_metrics']['LE'].append(episode_metrics['LE'])
+        episode_data['c1_metrics']['CT'].append(episode_metrics['CT'])
+        episode_data['c1_metrics']['SSE'].append(episode_metrics['SSE'])
+
+        episode_data['c2_metrics']['FV'].append(episode_metrics['FV'])
+        episode_data['c2_metrics']['IDR_UC'].append(episode_metrics['IDR_UC'])
+        episode_data['c2_metrics']['PE'].append(episode_metrics['PE'])
+        episode_data['c2_metrics']['AE'].append(episode_metrics['AE'])
 
         # 保存时间序列指标
         episode_data['time_step_metrics']['infection_rates'].append(episode_infections)
@@ -1337,10 +1558,14 @@ def train_simulation():
         prev_counter_rate = network.node_states[:, 2].mean().item()
 
         print(f"\n===== Phase 3 Episode {episode} Start =====")
+        episode_initial_states = network.node_states.detach().clone()
 
         # 记录动作历史用于C2指标计算
         suppress_actions_history = []
         rumor_actions_history = []
+        episode_action_trace = []
+        episode_policy_cost_history = []
+        episode_action_entropy_history = []
 
         for step in range(STEPS_PER_EPISODE):
             # 刷新 H_struct 与 H_dyn，并构造结构增强后的边特征
@@ -1389,6 +1614,12 @@ def train_simulation():
 
             # 单步传播
             macro_actions = macro_counter_action - macro_rumor_action
+            episode_action_trace.append({
+                'suppress_actions': list(suppress_actions),
+                'rumor_actions': list(rumor_actions),
+                'edge_indices': list(applied_edge_indices),
+                'macro_actions': macro_actions.detach().clone(),
+            })
             infection_rate, counter_rate = network.step(macro_actions=macro_actions)
             avg_infection += infection_rate
             avg_counter += counter_rate
@@ -1497,62 +1728,26 @@ def train_simulation():
             episode_suppress_opp_acc.append(suppress_acc)  # 按角色记录
             episode_rumor_opp_acc.append(rumor_acc)        # 按角色记录
 
-            # ==================== 新增：计算C1和C2指标 ====================
-            # 计算Lyapunov指数(LE)
-            if len(episode_infections) > 1:
-                le = np.mean(np.diff(np.log(np.array(episode_infections) + 1e-10)))
-                episode_c1_le.append(le)
-
-            # 计算稳态误差(SSE)
-            target_infection = 0.0
-            sse = abs(infection_rate - target_infection)
-            episode_c1_sse.append(sse)
-
-            # 计算感染峰值下降速度(FV)
-            peak_infection = max(episode_infections) if episode_infections else 0
-            fv = (peak_infection - infection_rate) / (len(episode_infections) + 1e-10)
-            episode_c2_fv.append(fv)
-
-            # 计算单位成本感染下降率(IDR_UC)
-            all_suppress_actions_flat = [action for step_actions in suppress_actions_history for action in step_actions]
-            all_rumor_actions_flat = [action for step_actions in rumor_actions_history for action in step_actions]
-
-            if all_suppress_actions_flat and all_rumor_actions_flat:
-                total_action_cost = np.mean(all_suppress_actions_flat) + np.mean(all_rumor_actions_flat)
-            else:
-                total_action_cost = 0
-            idr_uc = (INIT_INFECTION - infection_rate) / (total_action_cost + 1e-10)
-            episode_c2_idr_uc.append(idr_uc)
-
-            # 计算传播范围(PE)
-            ir_count = 0
-            for node_state in network.node_states:
-                if node_state[1] > 0.5 or node_state[3] > 0.5:
-                    ir_count += 1
-            pe = ir_count / len(network.node_states)
-            episode_c2_pe.append(pe)
-
-            # 计算策略动作熵(AE)
-            suppress_entropies = []
-            rumor_entropies = []
-            
+            # Collect policy-implied costs and action entropy for Eq. (A.10) and Eq. (A.14).
+            suppress_policy_probabilities = []
             for i in range(NUM_AGENTS):
-                if len(all_suppress_log_probs[i]) > 0:
-                    suppress_probs = torch.softmax(all_suppress_log_probs[i], dim=-1)
-                    suppress_entropy = calculate_entropy([suppress_probs.cpu().detach().numpy()])
-                    suppress_entropies.append(suppress_entropy)
-                
-                if len(all_rumor_log_probs[i]) > 0:
-                    rumor_probs = torch.softmax(all_rumor_log_probs[i], dim=-1)
-                    rumor_entropy = calculate_entropy([rumor_probs.cpu().detach().numpy()])
-                    rumor_entropies.append(rumor_entropy)
+                probabilities = getattr(controller.suppress_agents[i], 'last_action_probs', None)
+                if probabilities is None or probabilities.numel() == 0:
+                    suppress_policy_probabilities.append(None)
+                else:
+                    suppress_policy_probabilities.append(probabilities.detach().clone())
 
-            avg_suppress_entropy = np.mean(suppress_entropies) if suppress_entropies else 0
-            avg_rumor_entropy = np.mean(rumor_entropies) if rumor_entropies else 0
-            ae = (avg_suppress_entropy + avg_rumor_entropy) / 2
-            episode_c2_ae.append(ae)
-
-            # ==================== 指标计算结束 ====================
+            episode_policy_cost_history.append(
+                compute_policy_probability_cost(
+                    suppress_policy_probabilities,
+                    all_suppress_actions,
+                    all_suppress_log_probs,
+                    macro_counter_action,
+                )
+            )
+            episode_action_entropy_history.append(
+                compute_action_entropy(suppress_policy_probabilities)
+            )
 
             # 获取新边特征，并保持与当前观测相同的结构增强维度
             network.refresh_representations(detach=True)
@@ -1691,24 +1886,31 @@ def train_simulation():
         episode_data['action_distributions']['rumor_pred'].append(avg_episode_rumor_pred)
         episode_data['action_distributions']['rumor_true'].append(avg_episode_rumor_true)
 
-        # ==================== 新增：保存C1和C2指标 ====================
-        # 计算收敛时间(CT)
-        conv_time = STEPS_PER_EPISODE
-        for i, inf_rate in enumerate(episode_infections):
-            if inf_rate <= 0.05:  # 感染率低于5%认为收敛
-                conv_time = i
-                break
+        # ==================== 保存Appendices A.2-A.3定义的C1/C2指标 ====================
+        episode_metrics = finalize_episode_metrics(
+            network,
+            episode_initial_states,
+            episode_action_trace,
+            episode_policy_cost_history,
+            episode_action_entropy_history,
+        )
+        conv_time = episode_metrics['CT']
 
-        # 保存C1指标
-        episode_data['c1_metrics']['LE'].append(np.mean(episode_c1_le) if episode_c1_le else 0)
-        episode_data['c1_metrics']['CT'].append(conv_time)
-        episode_data['c1_metrics']['SSE'].append(np.mean(episode_c1_sse) if episode_c1_sse else 0)
+        episode_c1_le = list(episode_metrics['le_prefix'])
+        episode_c1_sse = [episode_metrics['SSE']]
+        episode_c2_fv = list(episode_metrics['fv_steps'])
+        episode_c2_idr_uc = list(episode_metrics['idr_uc_steps'])
+        episode_c2_pe = list(episode_metrics['pe_steps'])
+        episode_c2_ae = list(episode_metrics['ae_steps'])
 
-        # 保存C2指标
-        episode_data['c2_metrics']['FV'].append(np.mean(episode_c2_fv) if episode_c2_fv else 0)
-        episode_data['c2_metrics']['IDR_UC'].append(np.mean(episode_c2_idr_uc) if episode_c2_idr_uc else 0)
-        episode_data['c2_metrics']['PE'].append(np.mean(episode_c2_pe) if episode_c2_pe else 0)
-        episode_data['c2_metrics']['AE'].append(np.mean(episode_c2_ae) if episode_c2_ae else 0)
+        episode_data['c1_metrics']['LE'].append(episode_metrics['LE'])
+        episode_data['c1_metrics']['CT'].append(episode_metrics['CT'])
+        episode_data['c1_metrics']['SSE'].append(episode_metrics['SSE'])
+
+        episode_data['c2_metrics']['FV'].append(episode_metrics['FV'])
+        episode_data['c2_metrics']['IDR_UC'].append(episode_metrics['IDR_UC'])
+        episode_data['c2_metrics']['PE'].append(episode_metrics['PE'])
+        episode_data['c2_metrics']['AE'].append(episode_metrics['AE'])
 
         # 保存时间序列指标
         episode_data['time_step_metrics']['infection_rates'].append(episode_infections)
